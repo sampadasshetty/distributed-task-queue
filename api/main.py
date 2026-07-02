@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Response, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 from typing import Optional
@@ -7,8 +7,10 @@ from . import models
 from .database import engine, get_db
 from .schemas import JobCreate, JobResponse, JobListResponse
 from .models import JobStatus, JobPriority
-from .redis_client import redis_client, PRIORITY_SCORES, QUEUE_KEY   
+from .redis_client import redis_client, PRIORITY_SCORES, QUEUE_KEY
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+import time
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -25,6 +27,29 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+http_requests_total = Counter('api_http_requests_total', 'Total HTTP requests', ['method', 'endpoint', 'status'])
+http_request_duration_seconds = Histogram('api_http_request_duration_seconds', 'Request duration', ['method', 'endpoint'])
+jobs_submitted_total = Counter('api_jobs_submitted_total', 'Total jobs submitted', ['priority'])
+
+
+@app.middleware("http")
+async def track_metrics(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    duration = time.time() - start_time
+
+    endpoint = request.url.path
+    http_requests_total.labels(method=request.method, endpoint=endpoint, status=response.status_code).inc()
+    http_request_duration_seconds.labels(method=request.method, endpoint=endpoint).observe(duration)
+
+    return response
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 
 @app.get("/health")
 def health_check():
@@ -58,7 +83,10 @@ def create_job(job_data: JobCreate, db: Session = Depends(get_db)):
         priority_score = PRIORITY_SCORES[job_data.priority.value]
         redis_client.zadd(QUEUE_KEY, {str(db_job.id): priority_score})
 
+    jobs_submitted_total.labels(priority=job_data.priority.value).inc()
+
     return db_job
+
 
 @app.get("/jobs", response_model=JobListResponse)
 def list_jobs(
@@ -130,19 +158,20 @@ def retry_job(job_id: UUID, db: Session = Depends(get_db)):
     db.refresh(job)
     return job
 
+
 @app.get("/queue/status")
 def queue_status():
-    
     queue_length = redis_client.zcard(QUEUE_KEY)
     jobs_in_queue = redis_client.zrange(QUEUE_KEY, 0, -1, withscores=True)
-    
+
     return {
         "queue_length": queue_length,
         "jobs": [
-            {"job_id": job_id, "priority_score": score} 
+            {"job_id": job_id, "priority_score": score}
             for job_id, score in jobs_in_queue
         ]
     }
+
 
 @app.get("/stats")
 def get_stats(db: Session = Depends(get_db)):
